@@ -50,6 +50,7 @@ func TestBuildAgentWiresLocalCallerToApp(t *testing.T) {
 	t.Setenv("AGENTFIELD_API_KEY", "")
 	t.Setenv("PORT", "")
 	t.Setenv("OPENROUTER_API_KEY", "")
+	t.Setenv("OPENCODE_API_KEY", "")
 
 	n, err := BuildAgent("pr-af", "8007", "desc")
 	if err != nil {
