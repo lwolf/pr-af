@@ -31,7 +31,7 @@ func TestHarnessConfigProviderAwareBinary(t *testing.T) {
 func TestHarnessConfigPreservesExistingFields(t *testing.T) {
 	xdg := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", xdg)
-	for _, key := range []string{"OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GH_TOKEN"} {
+	for _, key := range []string{"OPENROUTER_API_KEY", "OPENCODE_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "GH_TOKEN"} {
 		t.Setenv(key, "")
 	}
 	t.Setenv("OPENAI_API_KEY", "openai-key")
@@ -61,7 +61,7 @@ func TestBuildAgentFromEnv(t *testing.T) {
 	}{
 		{
 			name:       "defaults when env unset",
-			env:        map[string]string{"NODE_ID": "", "PORT": "", "AGENTFIELD_SERVER": "", "OPENROUTER_API_KEY": ""},
+			env:        map[string]string{"NODE_ID": "", "PORT": "", "AGENTFIELD_SERVER": "", "OPENROUTER_API_KEY": "", "OPENCODE_API_KEY": ""},
 			wantNodeID: "pr-af",
 			wantServer: "http://localhost:8080",
 			wantListen: ":8007",
@@ -73,6 +73,7 @@ func TestBuildAgentFromEnv(t *testing.T) {
 				"PORT":               "9107",
 				"AGENTFIELD_SERVER":  "http://cp.internal:8080",
 				"OPENROUTER_API_KEY": "", // keep AIConfig off so New needs no key
+				"OPENCODE_API_KEY":   "",
 			},
 			wantNodeID: "pr-af-canary",
 			wantServer: "http://cp.internal:8080",
@@ -116,6 +117,7 @@ func TestBuildAgentWithLLMKey(t *testing.T) {
 	t.Setenv("NODE_ID", "")
 	t.Setenv("PORT", "")
 	t.Setenv("AGENTFIELD_SERVER", "")
+	t.Setenv("OPENCODE_API_KEY", "")
 	t.Setenv("OPENROUTER_API_KEY", "sk-or-test")
 
 	n, err := BuildAgent("pr-af", "8007", "desc")
@@ -127,15 +129,146 @@ func TestBuildAgentWithLLMKey(t *testing.T) {
 	}
 }
 
-// The .ai() path must receive the OpenRouter API model ID, with LiteLLM's
-// "openrouter/" routing prefix stripped — Python consumes that prefix in
-// LiteLLM, so a prefixed PR_AF_MODEL (the deploy default) must not reach the
-// OpenRouter API verbatim. Unprefixed models pass through untouched.
-func TestAIModelForAPIStripsOpenRouterRoutingPrefix(t *testing.T) {
-	if got := aiModelForAPI("openrouter/moonshotai/kimi-k2.5"); got != "moonshotai/kimi-k2.5" {
-		t.Errorf("prefixed: got %q, want moonshotai/kimi-k2.5", got)
+// resolveAIBackend picks the .ai() endpoint and normalises the model id. The
+// routing prefix must be stripped: Python consumes it inside LiteLLM, so a
+// prefixed PR_AF_MODEL (the deploy default) reaching the API verbatim is not a
+// valid model id at either provider. Unprefixed models pass through untouched.
+func TestResolveAIBackend(t *testing.T) {
+	const (
+		zenBase        = "https://opencode.ai/zen/v1"
+		openRouterBase = "https://openrouter.ai/api/v1"
+	)
+
+	cases := []struct {
+		name     string
+		model    string
+		env      map[string]string
+		wantNil  bool
+		wantMode string
+		wantBase string
+		wantKey  string
+	}{
+		{
+			name:     "openrouter prefix strips and routes to openrouter",
+			model:    "openrouter/moonshotai/kimi-k2.5",
+			env:      map[string]string{"OPENROUTER_API_KEY": "sk-or"},
+			wantMode: "moonshotai/kimi-k2.5",
+			wantBase: openRouterBase,
+			wantKey:  "sk-or",
+		},
+		{
+			name:     "opencode prefix strips and routes to zen",
+			model:    "opencode/claude-sonnet-5",
+			env:      map[string]string{"OPENCODE_API_KEY": "sk-zen"},
+			wantMode: "claude-sonnet-5",
+			wantBase: zenBase,
+			wantKey:  "sk-zen",
+		},
+		{
+			// The footgun this ordering exists to prevent: a Zen model id must
+			// never be posted to OpenRouter just because that key happens to be
+			// the one present.
+			name:    "prefixed model without its provider key is unconfigured",
+			model:   "opencode/claude-sonnet-5",
+			env:     map[string]string{"OPENROUTER_API_KEY": "sk-or"},
+			wantNil: true,
+		},
+		{
+			name:     "unprefixed model takes the first configured provider",
+			model:    "minimax/minimax-m2.5",
+			env:      map[string]string{"OPENCODE_API_KEY": "sk-zen"},
+			wantMode: "minimax/minimax-m2.5",
+			wantBase: zenBase,
+			wantKey:  "sk-zen",
+		},
+		{
+			name:     "explicit base URL overrides both providers",
+			model:    "opencode/claude-sonnet-5",
+			env:      map[string]string{"OPENCODE_API_KEY": "sk-zen", "PR_AF_AI_BASE_URL": "http://gateway.internal/v1", "PR_AF_AI_API_KEY": "sk-gw"},
+			wantMode: "claude-sonnet-5",
+			wantBase: "http://gateway.internal/v1",
+			wantKey:  "sk-gw",
+		},
+		{
+			name:    "no key at all leaves the gates unconfigured",
+			model:   "minimax/minimax-m2.5",
+			wantNil: true,
+		},
 	}
-	if got := aiModelForAPI("minimax/minimax-m2.5"); got != "minimax/minimax-m2.5" {
-		t.Errorf("unprefixed: got %q, want unchanged", got)
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Clear every key this resolver reads, so an ambient value in the
+			// developer's or CI's environment cannot decide the outcome.
+			for _, key := range []string{"OPENCODE_API_KEY", "OPENROUTER_API_KEY", "PR_AF_AI_BASE_URL", "PR_AF_AI_API_KEY"} {
+				t.Setenv(key, "")
+			}
+			for key, value := range tc.env {
+				t.Setenv(key, value)
+			}
+
+			got := resolveAIBackend(tc.model)
+			if tc.wantNil {
+				if got != nil {
+					t.Fatalf("resolveAIBackend(%q) = %+v, want nil", tc.model, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("resolveAIBackend(%q) = nil, want a config", tc.model)
+			}
+			if got.Model != tc.wantMode {
+				t.Errorf("Model = %q, want %q", got.Model, tc.wantMode)
+			}
+			if got.BaseURL != tc.wantBase {
+				t.Errorf("BaseURL = %q, want %q", got.BaseURL, tc.wantBase)
+			}
+			if got.APIKey != tc.wantKey {
+				t.Errorf("APIKey = %q, want %q", got.APIKey, tc.wantKey)
+			}
+		})
+	}
+}
+
+// BuildOneShot must not invent a control-plane URL. An empty AgentFieldURL is
+// what makes the SDK skip workflow-event emission, so a review that runs with
+// no control plane does not stall five seconds per phase on a dead localhost
+// port. BuildAgent keeps the localhost default for the served node.
+func TestBuildOneShotDefaultsToNoControlPlane(t *testing.T) {
+	for _, key := range []string{"NODE_ID", "PORT", "AGENTFIELD_SERVER", "OPENROUTER_API_KEY", "OPENCODE_API_KEY"} {
+		t.Setenv(key, "")
+	}
+
+	one, err := BuildOneShot("pr-af", "8007", "desc")
+	if err != nil {
+		t.Fatalf("BuildOneShot: %v", err)
+	}
+	if one.AgentFieldServer != "" {
+		t.Errorf("BuildOneShot AgentFieldServer = %q, want empty", one.AgentFieldServer)
+	}
+
+	served, err := BuildAgent("pr-af", "8007", "desc")
+	if err != nil {
+		t.Fatalf("BuildAgent: %v", err)
+	}
+	if served.AgentFieldServer != defaultControlPlaneURL {
+		t.Errorf("BuildAgent AgentFieldServer = %q, want %q", served.AgentFieldServer, defaultControlPlaneURL)
+	}
+}
+
+// An explicit AGENTFIELD_SERVER still wins for the one-shot path — that is how
+// a CI run reports its DAG to a self-hosted control plane.
+func TestBuildOneShotHonoursExplicitControlPlane(t *testing.T) {
+	for _, key := range []string{"NODE_ID", "PORT", "OPENROUTER_API_KEY", "OPENCODE_API_KEY"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("AGENTFIELD_SERVER", "https://cp.internal:8080")
+
+	n, err := BuildOneShot("pr-af", "8007", "desc")
+	if err != nil {
+		t.Fatalf("BuildOneShot: %v", err)
+	}
+	if n.AgentFieldServer != "https://cp.internal:8080" {
+		t.Errorf("AgentFieldServer = %q, want the explicit CP URL", n.AgentFieldServer)
 	}
 }
