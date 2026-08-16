@@ -213,6 +213,7 @@ func newTestNode(t *testing.T) *Node {
 	t.Setenv("AGENTFIELD_SERVER", "")
 	t.Setenv("AGENT_CALLBACK_URL", "")
 	t.Setenv("OPENROUTER_API_KEY", "")
+	t.Setenv("OPENCODE_API_KEY", "")
 	n, err := BuildAgent("pr-af", "8007", "AI-Native Pull Request Review Agent")
 	if err != nil {
 		t.Fatalf("BuildAgent: %v", err)

@@ -151,8 +151,34 @@ func resolvedHarnessBin(c config.AIIntegrationConfig) string {
 // OPENROUTER_API_KEY is set — construction succeeds without a key (matching
 // Python), and the AI call fails at call time either way when the key is absent.
 func BuildAgent(defaultNodeID, defaultPort, description string) (*Node, error) {
+	return buildAgent(defaultNodeID, defaultPort, description, defaultControlPlaneURL)
+}
+
+// BuildOneShot builds the same node as BuildAgent, but defaults
+// AGENTFIELD_SERVER to EMPTY instead of http://localhost:8080.
+//
+// It exists for cmd/pr-af-review, which runs one review in-process and exits.
+// That path never calls Serve, so it never registers with a control plane; the
+// only thing a CP URL would still do is receive workflow events. Those are
+// emitted best-effort — the SDK returns early when AgentFieldURL is empty
+// (agent.emitWorkflowEvent) and only logs a send failure otherwise — so an
+// empty default means a one-shot review needs no control plane at all, and
+// does not spend five seconds per phase timing out against a localhost port
+// with nothing behind it.
+//
+// Set AGENTFIELD_SERVER to a real control plane and the one-shot run reports
+// its DAG there exactly as the long-running node does.
+func BuildOneShot(defaultNodeID, defaultPort, description string) (*Node, error) {
+	return buildAgent(defaultNodeID, defaultPort, description, "")
+}
+
+// defaultControlPlaneURL is the CP URL the long-running node assumes when
+// AGENTFIELD_SERVER is unset (docker-compose.go.yml sets it explicitly).
+const defaultControlPlaneURL = "http://localhost:8080"
+
+func buildAgent(defaultNodeID, defaultPort, description, defaultServer string) (*Node, error) {
 	nodeID := envOr("NODE_ID", defaultNodeID)
-	server := envOr("AGENTFIELD_SERVER", "http://localhost:8080")
+	server := envOr("AGENTFIELD_SERVER", defaultServer)
 	token := os.Getenv("AGENTFIELD_API_KEY")
 	port := envOr("PORT", defaultPort)
 
@@ -173,20 +199,7 @@ func BuildAgent(defaultNodeID, defaultPort, description string) (*Node, error) {
 		CLIConfig:     &agent.CLIConfig{AppDescription: description},
 		HarnessConfig: harnessConfig(aiConf),
 	}
-	if apiKey := os.Getenv("OPENROUTER_API_KEY"); apiKey != "" {
-		// Python's .ai() path runs through LiteLLM, which CONSUMES a leading
-		// "openrouter/" as its routing prefix before calling the OpenRouter API.
-		// The Go SDK's ai client posts the model string verbatim to BaseURL, and
-		// OpenRouter rejects "openrouter/moonshotai/..." as an invalid model ID —
-		// so strip the routing prefix here to reach the same model Python does.
-		// The HARNESS model keeps the prefix (opencode's config wants it; the
-		// entrypoint derives its model key by stripping it there too).
-		cfg.AIConfig = &ai.Config{
-			Model:   aiModelForAPI(aiConf.AIModel),
-			APIKey:  apiKey,
-			BaseURL: "https://openrouter.ai/api/v1",
-		}
-	}
+	cfg.AIConfig = resolveAIBackend(aiConf.AIModel)
 
 	app, err := agent.New(cfg)
 	if err != nil {
@@ -259,6 +272,20 @@ func (n *Node) Serve(ctx context.Context) error {
 	return srv.Shutdown(shutdownCtx)
 }
 
+// RunReview executes the `review` reasoner in-process and returns its result,
+// exactly as an inbound control-plane execution would — the same handler, the
+// same repo resolution, the same orchestrator, the same budget caps.
+//
+// What it skips is the plumbing around that handler: no listener is bound, no
+// registration is sent, and nothing polls. The orchestrator's phases run
+// through App.CallLocal, which dispatches registered reasoners inside this
+// process, so the whole DAG completes without a control plane in the loop.
+//
+// Call RegisterAll first — CallLocal resolves phases by registered name.
+func (n *Node) RunReview(ctx context.Context, input map[string]any) (any, error) {
+	return n.reviewHandler(ctx, input)
+}
+
 // envOr returns the value of key, or def when the env var is unset or empty.
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -267,13 +294,83 @@ func envOr(key, def string) string {
 	return def
 }
 
-// aiModelForAPI converts the configured AI model into the model ID the
-// OpenRouter API expects. Python's .ai() path runs through LiteLLM, which
-// CONSUMES a leading "openrouter/" as its routing prefix before calling the
-// OpenRouter API; the Go SDK's ai client posts the model string verbatim to
-// BaseURL, where "openrouter/moonshotai/..." is an invalid model ID. Stripping
-// the routing prefix reaches the same model Python does. The HARNESS model is
-// untouched (opencode's config expects the prefixed form).
-func aiModelForAPI(model string) string {
-	return strings.TrimPrefix(model, "openrouter/")
+// aiProvider is one OpenAI-compatible endpoint the .ai() gates can post to.
+//
+// Both fields of the pair matter. Prefix is the routing prefix opencode uses in
+// a model id ("openrouter/moonshotai/kimi-k2.5", "opencode/claude-sonnet-5");
+// the harness model KEEPS it, because that is the form the opencode CLI's -m
+// flag expects. The .ai() path must STRIP it: Python's .ai() runs through
+// LiteLLM, which consumes the prefix as its own routing hint, whereas the Go
+// SDK's ai client posts the model string verbatim to BaseURL — where a
+// provider-prefixed id is not a valid model.
+type aiProvider struct {
+	prefix  string
+	envKey  string
+	baseURL string
+}
+
+// aiProviders is ordered: an unprefixed model picks the first entry whose key
+// is present. OpenCode Zen leads because it is the provider this fork exists to
+// support; OpenRouter stays as upstream's original backend so a checkout
+// configured the upstream way behaves exactly as it did before.
+var aiProviders = []aiProvider{
+	{prefix: "opencode/", envKey: "OPENCODE_API_KEY", baseURL: "https://opencode.ai/zen/v1"},
+	{prefix: "openrouter/", envKey: "OPENROUTER_API_KEY", baseURL: "https://openrouter.ai/api/v1"},
+}
+
+// resolveAIBackend picks the endpoint for the two .ai() gates (intake and
+// coverage), returning nil when none is configured — the SDK rejects an empty
+// API key at construction, so "no key" must mean "no AIConfig", and the gate
+// then fails at call time with the SDK's own message. That is upstream's
+// behaviour and it is preserved.
+//
+// Precedence:
+//
+//  1. PR_AF_AI_BASE_URL + PR_AF_AI_API_KEY — an explicit escape hatch for any
+//     OpenAI-compatible endpoint that is neither of the two known providers.
+//  2. A model that names a provider ("opencode/...", "openrouter/...") pins the
+//     backend to that provider. If its key is missing we return nil rather than
+//     silently sending a Zen model id to OpenRouter, or vice versa.
+//  3. An unprefixed model ("minimax/minimax-m2.5", the code default) takes the
+//     first provider whose key is set.
+func resolveAIBackend(model string) *ai.Config {
+	if baseURL := os.Getenv("PR_AF_AI_BASE_URL"); baseURL != "" {
+		apiKey := os.Getenv("PR_AF_AI_API_KEY")
+		if apiKey == "" {
+			log.Printf("pr-af: PR_AF_AI_BASE_URL is set but PR_AF_AI_API_KEY is empty; .ai() gates are unconfigured")
+			return nil
+		}
+		return &ai.Config{Model: stripProviderPrefix(model), APIKey: apiKey, BaseURL: baseURL}
+	}
+
+	for _, p := range aiProviders {
+		if !strings.HasPrefix(model, p.prefix) {
+			continue
+		}
+		apiKey := os.Getenv(p.envKey)
+		if apiKey == "" {
+			log.Printf("pr-af: model %q selects provider %q but %s is empty; .ai() gates are unconfigured",
+				model, strings.TrimSuffix(p.prefix, "/"), p.envKey)
+			return nil
+		}
+		return &ai.Config{Model: strings.TrimPrefix(model, p.prefix), APIKey: apiKey, BaseURL: p.baseURL}
+	}
+
+	for _, p := range aiProviders {
+		if apiKey := os.Getenv(p.envKey); apiKey != "" {
+			return &ai.Config{Model: model, APIKey: apiKey, BaseURL: p.baseURL}
+		}
+	}
+	return nil
+}
+
+// stripProviderPrefix removes a known routing prefix from a model id, leaving
+// an unknown or absent prefix alone.
+func stripProviderPrefix(model string) string {
+	for _, p := range aiProviders {
+		if strings.HasPrefix(model, p.prefix) {
+			return strings.TrimPrefix(model, p.prefix)
+		}
+	}
+	return model
 }
