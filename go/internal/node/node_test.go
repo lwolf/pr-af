@@ -136,6 +136,7 @@ func TestBuildAgentWithLLMKey(t *testing.T) {
 func TestResolveAIBackend(t *testing.T) {
 	const (
 		zenBase        = "https://opencode.ai/zen/v1"
+		zenGoBase      = "https://opencode.ai/zen/go/v1"
 		openRouterBase = "https://openrouter.ai/api/v1"
 	)
 
@@ -174,11 +175,33 @@ func TestResolveAIBackend(t *testing.T) {
 			wantNil: true,
 		},
 		{
+			// Zen's two packages share OPENCODE_API_KEY but not their
+			// catalogs, so the prefix must pick the endpoint. glm-5.3 is
+			// Go-only: routing it to plain /zen/v1 would fail at request time.
+			name:     "opencode-go prefix strips and routes to the Go package",
+			model:    "opencode-go/glm-5.3",
+			env:      map[string]string{"OPENCODE_API_KEY": "sk-zen"},
+			wantMode: "glm-5.3",
+			wantBase: zenGoBase,
+			wantKey:  "sk-zen",
+		},
+		{
+			// "opencode-go/" must not be swallowed by the "opencode/" entry.
+			// HasPrefix separates them ('-' != '/'), and this pins that: the
+			// same model id under the two prefixes must reach two endpoints.
+			name:     "opencode prefix still routes to plain Zen, not the Go package",
+			model:    "opencode/glm-5.2",
+			env:      map[string]string{"OPENCODE_API_KEY": "sk-zen"},
+			wantMode: "glm-5.2",
+			wantBase: zenBase,
+			wantKey:  "sk-zen",
+		},
+		{
 			name:     "unprefixed model takes the first configured provider",
 			model:    "minimax/minimax-m2.5",
 			env:      map[string]string{"OPENCODE_API_KEY": "sk-zen"},
 			wantMode: "minimax/minimax-m2.5",
-			wantBase: zenBase,
+			wantBase: zenGoBase,
 			wantKey:  "sk-zen",
 		},
 		{
