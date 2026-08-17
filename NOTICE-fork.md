@@ -14,12 +14,30 @@ and read `OPENROUTER_API_KEY`, so the intake and coverage gates could only ever
 reach OpenRouter — even when the harness itself was pointed elsewhere.
 
 `resolveAIBackend` now picks the endpoint from the model's routing prefix and
-the keys present in the environment: `opencode/*` + `OPENCODE_API_KEY` reaches
-OpenCode Zen (`https://opencode.ai/zen/v1`), `openrouter/*` +
-`OPENROUTER_API_KEY` reaches OpenRouter exactly as before, and
-`PR_AF_AI_BASE_URL` / `PR_AF_AI_API_KEY` address anything else. A model that
-names a provider whose key is missing leaves the gates unconfigured rather than
-posting that model id to the other provider.
+the keys present in the environment:
+
+| model prefix | key | endpoint |
+|---|---|---|
+| `opencode-go/*` | `OPENCODE_API_KEY` | `https://opencode.ai/zen/go/v1` |
+| `opencode/*` | `OPENCODE_API_KEY` | `https://opencode.ai/zen/v1` |
+| `openrouter/*` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` (unchanged) |
+| anything | `PR_AF_AI_API_KEY` | `PR_AF_AI_BASE_URL` |
+
+A model that names a provider whose key is missing leaves the gates
+unconfigured rather than posting that model id to the other provider.
+
+**Zen is two packages behind one key, and they are not interchangeable.** When
+this was written `/zen/v1` served 62 models and `/zen/go/v1` served 26, each
+carrying ids the other lacks — `glm-5.3` is Go-only; the `gpt-5.x` and Claude
+tiers are plain-Zen-only. So the prefix pins the package, not just the vendor,
+and `opencode-go/glm-5.3` is not a synonym for `opencode/glm-5.3`.
+
+The prefixes reuse the opencode CLI's **own** provider ids, read out of its
+embedded registry (`{id:"opencode-go", env:["OPENCODE_API_KEY"],
+api:"https://opencode.ai/zen/go/v1"}`). The harness passes the model to `-m`
+verbatim while these gates strip the prefix; matching the CLI's vocabulary
+means one string is correct in both paths instead of needing a translation
+table. Note the hyphen — `opencode-go`, not `opencode_go`.
 
 An existing OpenRouter deployment is unaffected: same base URL, same key, same
 prefix-stripping behaviour.

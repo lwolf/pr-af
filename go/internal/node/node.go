@@ -297,7 +297,7 @@ func envOr(key, def string) string {
 // aiProvider is one OpenAI-compatible endpoint the .ai() gates can post to.
 //
 // Both fields of the pair matter. Prefix is the routing prefix opencode uses in
-// a model id ("openrouter/moonshotai/kimi-k2.5", "opencode/claude-sonnet-5");
+// a model id ("openrouter/moonshotai/kimi-k2.5", "opencode-go/glm-5.2");
 // the harness model KEEPS it, because that is the form the opencode CLI's -m
 // flag expects. The .ai() path must STRIP it: Python's .ai() runs through
 // LiteLLM, which consumes the prefix as its own routing hint, whereas the Go
@@ -310,10 +310,26 @@ type aiProvider struct {
 }
 
 // aiProviders is ordered: an unprefixed model picks the first entry whose key
-// is present. OpenCode Zen leads because it is the provider this fork exists to
-// support; OpenRouter stays as upstream's original backend so a checkout
-// configured the upstream way behaves exactly as it did before.
+// is present. OpenCode Go leads because it is the package this fork is deployed
+// against; plain Zen follows; OpenRouter stays as upstream's original backend so
+// a checkout configured the upstream way behaves exactly as it did before.
+//
+// Zen ships as TWO packages behind one OPENCODE_API_KEY, and they are not
+// interchangeable — /zen/v1 served 62 models and /zen/go/v1 served 26 when this
+// was written, with each carrying ids the other lacks (glm-5.3 is Go-only;
+// gpt-5.x and the Claude tiers are plain-Zen-only). Sending an id to the wrong
+// one fails at request time, which is why they are separate entries rather than
+// a single endpoint with a shared catalog.
+//
+// The prefixes deliberately reuse the opencode CLI's OWN provider ids, taken
+// from its embedded registry ("opencode-go", api https://opencode.ai/zen/go/v1,
+// env OPENCODE_API_KEY). Because the harness passes PR_AF_MODEL to `-m`
+// verbatim while these gates strip the prefix, any divergence between the two
+// vocabularies would need a translation table; matching the CLI means one
+// string is correct in both places. Note the HYPHEN: "opencode-go", not
+// "opencode_go". No collision with "opencode/" — HasPrefix distinguishes them.
 var aiProviders = []aiProvider{
+	{prefix: "opencode-go/", envKey: "OPENCODE_API_KEY", baseURL: "https://opencode.ai/zen/go/v1"},
 	{prefix: "opencode/", envKey: "OPENCODE_API_KEY", baseURL: "https://opencode.ai/zen/v1"},
 	{prefix: "openrouter/", envKey: "OPENROUTER_API_KEY", baseURL: "https://openrouter.ai/api/v1"},
 }
@@ -328,11 +344,14 @@ var aiProviders = []aiProvider{
 //
 //  1. PR_AF_AI_BASE_URL + PR_AF_AI_API_KEY — an explicit escape hatch for any
 //     OpenAI-compatible endpoint that is neither of the two known providers.
-//  2. A model that names a provider ("opencode/...", "openrouter/...") pins the
-//     backend to that provider. If its key is missing we return nil rather than
-//     silently sending a Zen model id to OpenRouter, or vice versa.
+//  2. A model that names a provider ("opencode-go/...", "opencode/...",
+//     "openrouter/...") pins the backend to that provider. If its key is missing
+//     we return nil rather than silently sending a Zen model id to OpenRouter,
+//     or vice versa. Note this pins the PACKAGE too: "opencode-go/glm-5.3" and
+//     "opencode/glm-5.3" share a key, but only the first has that model.
 //  3. An unprefixed model ("minimax/minimax-m2.5", the code default) takes the
-//     first provider whose key is set.
+//     first provider whose key is set — OpenCode Go, when OPENCODE_API_KEY is
+//     the one present.
 func resolveAIBackend(model string) *ai.Config {
 	if baseURL := os.Getenv("PR_AF_AI_BASE_URL"); baseURL != "" {
 		apiKey := os.Getenv("PR_AF_AI_API_KEY")
